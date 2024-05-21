@@ -27,11 +27,13 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     const float slope = get_alibi_slope(max_bias, rowx/nrows_y, n_head_log2, m0, m1);
 
     extern __shared__ float data_soft_max_f32[];
-    float * buf_iw = data_soft_max_f32; // shared memory buffer for inter-warp communication
+    float * buf_max = data_soft_max_f32; // shared memory buffer for inter-warp communication (for max values)
+    float * buf_den = data_soft_max_f32 + WARP_SIZE; // shared memory buffer for inter-warp communication (for sum(exp(v - max)))
     // shared memory buffer to cache values between iterations:
-    float * vals = vals_smem ? buf_iw + WARP_SIZE : dst + (int64_t)rowx*ncols;
+    float * vals = vals_smem ? buf_max + 2 * WARP_SIZE : dst + (int64_t)rowx*ncols;
 
     float max_val = -INFINITY;
+    float den = 1;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -46,61 +48,62 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
 
         const float val = x[ix]*scale + (mask ? slope*t2f32(mask[iy]) : 0.0f);
 
-        vals[col] = val;
+        if (vals_smem) {
+            vals[col] = val;
+        }
+
+        float last_max_val = max_val;
         max_val = max(max_val, val);
+        den = (isinf(last_max_val) ? 0.F : den * expf(last_max_val - max_val)) +
+              expf(val - max_val);
     }
-
-    // find the max value in the block
-    max_val = warp_reduce_max(max_val);
-    if (block_size > WARP_SIZE) {
-        if (warp_id == 0) {
-            buf_iw[lane_id] = -INFINITY;
-        }
-        __syncthreads();
-
-        if (lane_id == 0) {
-            buf_iw[warp_id] = max_val;
-        }
-        __syncthreads();
-
-        max_val = buf_iw[lane_id];
-        max_val = warp_reduce_max(max_val);
-    }
-
-    float tmp = 0.0f; // partial sum
 
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
-        const int col = col0 + tid;
+    for (int radix = 1; radix < 32; radix <<= 1) {
+        constexpr auto shfl_mask = static_cast<uint32_t>(-1);
+        float butterflied_v = __shfl_xor_sync(shfl_mask, max_val, radix);
+        float butterflied_d = __shfl_xor_sync(shfl_mask, den, radix);
 
-        if (ncols_template == 0 && col >= ncols) {
-            break;
-        }
+        float this_max_val = max(max_val, butterflied_v);
 
-        const float val = expf(vals[col] - max_val);
-        tmp += val;
-        vals[col] = val;
+        den = isinf(this_max_val) ? 0
+                           : (den * exp(max_val - this_max_val) +
+                              butterflied_d * exp(butterflied_v - this_max_val));
+        max_val = this_max_val;
     }
 
-    // find the sum of exps in the block
-    tmp = warp_reduce_sum(tmp);
     if (block_size > WARP_SIZE) {
-        __syncthreads();
         if (warp_id == 0) {
-            buf_iw[lane_id] = 0.0f;
+            buf_max[lane_id] = -INFINITY;
+            buf_den[lane_id] = 1;
         }
         __syncthreads();
 
         if (lane_id == 0) {
-            buf_iw[warp_id] = tmp;
+            buf_max[warp_id] = max_val;
+            buf_den[warp_id] = den;
         }
         __syncthreads();
 
-        tmp = buf_iw[lane_id];
-        tmp = warp_reduce_sum(tmp);
+        max_val = buf_max[lane_id];
+        den = buf_den[lane_id];
+        
+#pragma unroll
+        for (int radix = 1; radix < 32; radix <<= 1) {
+            constexpr auto shfl_mask = static_cast<uint32_t>(-1);
+            float butterflied_v = __shfl_xor_sync(shfl_mask, max_val, radix);
+            float butterflied_d = __shfl_xor_sync(shfl_mask, den, radix);
+
+            float this_max_val = max(max_val, butterflied_v);
+
+            den = isinf(this_max_val) ? 0
+                               : (den * exp(max_val - this_max_val) +
+                                  butterflied_d * exp(butterflied_v - this_max_val));
+            max_val = this_max_val;
+        }
     }
 
-    const float inv_sum = 1.0f / tmp;
+    const float inv_sum = 1.0f / den;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -110,8 +113,16 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
             return;
         }
 
-        const int64_t idst = (int64_t)rowx*ncols + col;
-        dst[idst] = vals[col] * inv_sum;
+        const int64_t idst = (int64_t)rowx * ncols + col;
+        const int64_t ix = (int64_t)rowx * ncols + col;
+        const int64_t iy = (int64_t)rowy * ncols + col;
+
+        const float val =
+            vals_smem
+                ? vals[col]
+                : (x[ix] * scale + (mask ? slope * t2f32(mask[iy]) : 0.0f));
+
+        dst[idst] = expf(val - max_val) * inv_sum;
     }
 }
 
@@ -121,7 +132,7 @@ static void soft_max_f32_cuda(const float * x, const T * mask, float * dst, cons
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
     const dim3 block_nums(nrows_x, 1, 1);
-    const size_t shmem = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
+    const size_t shmem = (GGML_PAD(ncols_x, WARP_SIZE) + 2 * WARP_SIZE) * sizeof(float);
     static_assert(CUDA_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
 
     const uint32_t n_head      = nrows_x/nrows_y;
@@ -162,7 +173,7 @@ static void soft_max_f32_cuda(const float * x, const T * mask, float * dst, cons
                 break;
         }
     } else {
-        const size_t shmem_low = WARP_SIZE*sizeof(float);
+        const size_t shmem_low = 2 * WARP_SIZE * sizeof(float);
         soft_max_f32<false, 0, 0><<<block_nums, block_dims, shmem_low, stream>>>(x, mask, dst, ncols_x, nrows_y, scale, max_bias, m0, m1, n_head_log2);
     }
 }
