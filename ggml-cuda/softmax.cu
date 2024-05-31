@@ -50,13 +50,18 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         const int64_t iy = (int64_t)rowy*ncols + col;
 
         val = x[ix]*scale + (mask ? slope*t2f32(mask[iy]) : 0.0f);
-        
-        if (not is_fit_in_block) { vals[col] = val; }
 
-        float last_max_val = max_val;
-        max_val = max(max_val, val);
-        den = (isinf(last_max_val) ? 0.F : den * expf(last_max_val - max_val)) +
-              expf(val - max_val);
+        if (is_fit_in_block) {
+            max_val = val;
+        } else {
+            if (vals_smem) { vals[col] = val; }
+
+            float last_max_val = max_val;
+            max_val = max(max_val, val);
+            den = (isinf(last_max_val) 
+                    ? 0.F
+                    : den * expf(last_max_val - max_val)) + expf(val - max_val);
+        }
     }
 
 #pragma unroll
@@ -67,9 +72,9 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
 
         float this_max_val = max(max_val, butterflied_v);
 
-        den = isinf(this_max_val) ? 0
-                           : (den * exp(max_val - this_max_val) +
-                              butterflied_d * exp(butterflied_v - this_max_val));
+        den = isinf(this_max_val)
+                ? 0.F
+                : (den * exp(max_val - this_max_val) + butterflied_d * exp(butterflied_v - this_max_val));
         max_val = this_max_val;
     }
 
@@ -97,9 +102,9 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
 
             float this_max_val = max(max_val, butterflied_v);
 
-            den = isinf(this_max_val) ? 0
-                               : (den * exp(max_val - this_max_val) +
-                                  butterflied_d * exp(butterflied_v - this_max_val));
+            den = isinf(this_max_val) 
+                    ? 0.F
+                    : (den * exp(max_val - this_max_val) + butterflied_d * exp(butterflied_v - this_max_val));
             max_val = this_max_val;
         }
     }
@@ -115,8 +120,12 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         }
 
         const int64_t idst = (int64_t)rowx * ncols + col;
+        const int64_t ix = (int64_t)rowx*ncols + col;
+        const int64_t iy = (int64_t)rowy*ncols + col;
 
-        const float value = is_fit_in_block ? val : vals[col];
+        const float value = is_fit_in_block
+                ? val
+                : (vals_smem ? vals[col] : x[ix] * scale + (mask ? slope * t2f32(mask[iy]) : 0.0f));
 
         dst[idst] = expf(value - max_val) * inv_sum;
     }
