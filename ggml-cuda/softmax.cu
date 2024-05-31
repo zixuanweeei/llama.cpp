@@ -60,7 +60,8 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
             max_val = max(max_val, val);
             den = (isinf(last_max_val) 
                     ? 0.F
-                    : den * expf(last_max_val - max_val)) + expf(val - max_val);
+                    : den * expf(last_max_val - max_val))
+                + expf(val - max_val);
         }
     }
 
@@ -74,7 +75,7 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
 
         den = isinf(this_max_val)
                 ? 0.F
-                : (den * exp(max_val - this_max_val) + butterflied_d * exp(butterflied_v - this_max_val));
+                : (den * expf(max_val - this_max_val) + butterflied_d * expf(butterflied_v - this_max_val));
         max_val = this_max_val;
     }
 
@@ -104,7 +105,7 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
 
             den = isinf(this_max_val) 
                     ? 0.F
-                    : (den * exp(max_val - this_max_val) + butterflied_d * exp(butterflied_v - this_max_val));
+                    : (den * expf(max_val - this_max_val) + butterflied_d * expf(butterflied_v - this_max_val));
             max_val = this_max_val;
         }
     }
