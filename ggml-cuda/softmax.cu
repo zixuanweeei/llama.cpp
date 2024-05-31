@@ -20,6 +20,7 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     const int rowy = rowx % nrows_y; // broadcast the mask in the row dimension
 
     const int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
+    const bool is_fit_in_block = ncols < block_size;
 
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
@@ -35,6 +36,8 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     float max_val = -INFINITY;
     float den = 1;
 
+    float val = -INFINITY;
+
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
         const int col = col0 + tid;
@@ -46,11 +49,9 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         const int64_t ix = (int64_t)rowx*ncols + col;
         const int64_t iy = (int64_t)rowy*ncols + col;
 
-        const float val = x[ix]*scale + (mask ? slope*t2f32(mask[iy]) : 0.0f);
-
-        if (vals_smem) {
-            vals[col] = val;
-        }
+        val = x[ix]*scale + (mask ? slope*t2f32(mask[iy]) : 0.0f);
+        
+        if (not is_fit_in_block) { vals[col] = val; }
 
         float last_max_val = max_val;
         max_val = max(max_val, val);
@@ -114,15 +115,10 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         }
 
         const int64_t idst = (int64_t)rowx * ncols + col;
-        const int64_t ix = (int64_t)rowx * ncols + col;
-        const int64_t iy = (int64_t)rowy * ncols + col;
 
-        const float val =
-            vals_smem
-                ? vals[col]
-                : (x[ix] * scale + (mask ? slope * t2f32(mask[iy]) : 0.0f));
+        const float value = is_fit_in_block ? val : vals[col];
 
-        dst[idst] = expf(val - max_val) * inv_sum;
+        dst[idst] = expf(value - max_val) * inv_sum;
     }
 }
 
