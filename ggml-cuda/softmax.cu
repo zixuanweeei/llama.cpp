@@ -20,7 +20,7 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     const int rowy = rowx % nrows_y; // broadcast the mask in the row dimension
 
     const int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
-    const bool is_fit_in_block = ncols < block_size;
+    const bool is_fit_in_block = ncols <= block_size;
 
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
